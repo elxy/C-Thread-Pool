@@ -2,7 +2,9 @@
  * 
  * Author:  Johan Hanssen Seferidis
  * Date:    12/08/2011
- * Update:  01/11/2011
+ * Update:  09/13/2014
+ *          Transfer to multiple job queue structure.
+ *          by elxy
  * License: LGPL
  * 
  * 
@@ -19,7 +21,10 @@
  * thpool       = threadpool
  * thpool_t     = threadpool type
  * tp_p         = threadpool pointer
+ * tag          = job's tag
  * sem          = semaphore
+ * h_lock       = lock of job queue head
+ * t_lock       = lock of job queue tail
  * xN           = x can be any string. N stands for amount
  * 
  * */
@@ -29,24 +34,20 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <errno.h>
+#include <unistd.h>
 
 #include "thpool.h"      /* here you can also find the interface to each function */
 
 
 static int thpool_keepalive=1;
 
-/* Create mutex variable */
-pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER; /* used to serialize queue access */
-
-
-
 
 /* Initialise thread pool */
 thpool_t* thpool_init(int threadsN){
 	thpool_t* tp_p;
-	
+
 	if (!threadsN || threadsN<1) threadsN=1;
-	
+
 	/* Make new thread pool */
 	tp_p=(thpool_t*)malloc(sizeof(thpool_t));                              /* MALLOC thread pool */
 	if (tp_p==NULL){
@@ -59,24 +60,28 @@ thpool_t* thpool_init(int threadsN){
 		return NULL;
 	}
 	tp_p->threadsN=threadsN;
-	
-	/* Initialise the job queue */
-	if (thpool_jobqueue_init(tp_p)==-1){
-		fprintf(stderr, "thpool_init(): Could not allocate memory for job queue\n");
-		return NULL;
-	}
-	
-	/* Initialise semaphore*/
-	tp_p->jobqueue->queueSem=(sem_t*)malloc(sizeof(sem_t));                 /* MALLOC job queue semaphore */
-	sem_init(tp_p->jobqueue->queueSem, 0, 0); /* no shared, initial value */
-	
-	/* Make threads in pool */
+
+	/* Initialise each job queue */
+	tp_p->jobqueue = (thpool_jobqueue **) malloc(tp_p->threadsN * sizeof(thpool_jobqueue *));
+
 	int t;
+	printf("tp_p->jobqueue's address is %p\n", tp_p->jobqueue);
+	/* Make threads in pool */
+	for (t = 0; t < threadsN; t++){
+		if (thpool_jobqueue_init(& (tp_p->jobqueue[t])) == -1){
+			fprintf(stderr, "thpool_init(): Could not allocate memory for job queues.\n"); /* MALLOCS INSIDE PTHREAD HERE */
+			return NULL;
+		}
+		/* printf("tp_p->jobqueue[%d]'s address is %p\n", t, tp_p->jobqueue[t]); */
+		/* printf("tp_p->jobqueue[%d] points %p\n", t, tp_p->jobqueue[t]); */
+	}
+
+	/* Make threads in pool */
 	for (t=0; t<threadsN; t++){
 		printf("Created thread %d in pool \n", t);
-		pthread_create(&(tp_p->threads[t]), NULL, (void *)thpool_thread_do, (void *)tp_p); /* MALLOCS INSIDE PTHREAD HERE */
+		pthread_create(&(tp_p->threads[t]), NULL, (void *)thpool_thread_do, (void *)tp_p->jobqueue[t]); /* MALLOCS INSIDE PTHREAD HERE */
 	}
-	
+
 	return tp_p;
 }
 
@@ -85,62 +90,54 @@ thpool_t* thpool_init(int threadsN){
  * */
 /* There are two scenarios here. One is everything works as it should and second if
  * the thpool is to be killed. In that manner we try to BYPASS sem_wait and end each thread. */
-void thpool_thread_do(thpool_t* tp_p){
+void thpool_thread_do(thpool_jobqueue *jobqueue){
 
 	while(thpool_keepalive){
-		
-		if (sem_wait(tp_p->jobqueue->queueSem)) {/* WAITING until there is work in the queue */
+
+		if (sem_wait(jobqueue->queueSem)){/* WAITING until there is work in the queue */
 			perror("thpool_thread_do(): Waiting for semaphore");
 			exit(1);
 		}
 
 		if (thpool_keepalive){
-			
 			/* Read job from queue and execute it */
-			void*(*func_buff)(void* arg);
-			void*  arg_buff;
-			thpool_job_t* job_p;
-	
-			pthread_mutex_lock(&mutex);                  /* LOCK */
-			
-			job_p = thpool_jobqueue_peek(tp_p);
-			func_buff=job_p->function;
-			arg_buff =job_p->arg;
-			thpool_jobqueue_removelast(tp_p);
-			
-			pthread_mutex_unlock(&mutex);                /* UNLOCK */
-			
-			func_buff(arg_buff);               			 /* run function */
-			free(job_p);                                                       /* DEALLOC job */
-		}
-		else
-		{
+			struct job_value job;
+
+			thpool_jobqueue_get(jobqueue, &job);
+
+			/* run function */
+			job.function(job.arg);
+		}else{
 			return; /* EXIT thread*/
 		}
 	}
+
 	return;
 }
 
 
 /* Add work to the thread pool */
-int thpool_add_work(thpool_t* tp_p, void *(*function_p)(void*), void* arg_p){
-	thpool_job_t* newJob;
-	
-	newJob=(thpool_job_t*)malloc(sizeof(thpool_job_t));                        /* MALLOC job */
+int thpool_add_work(thpool_t *tp_p, int tag, void * (*function_p)(void *), void *arg_p){
+	thpool_job_t *newJob = (thpool_job_t *) malloc(sizeof(thpool_job_t));         /* MALLOC job */
+	/* printf("newJob's address is %p\n", newJob); */
+
 	if (newJob==NULL){
 		fprintf(stderr, "thpool_add_work(): Could not allocate memory for new job\n");
 		exit(1);
 	}
-	
+
 	/* add function and argument */
-	newJob->function=function_p;
-	newJob->arg=arg_p;
-	
+	newJob->value.function = function_p;
+	newJob->value.arg = arg_p;
+
+	/* choose a queue to add */
+	/* To apply advanced task schedule, you need to change your way
+	 * to produce tag. */
+	int q_num = tag % tp_p->threadsN;
+
 	/* add job to queue */
-	pthread_mutex_lock(&mutex);                  /* LOCK */
-	thpool_jobqueue_add(tp_p, newJob);
-	pthread_mutex_unlock(&mutex);                /* UNLOCK */
-	
+	thpool_jobqueue_add(tp_p->jobqueue[q_num], newJob);
+
 	return 0;
 }
 
@@ -148,135 +145,163 @@ int thpool_add_work(thpool_t* tp_p, void *(*function_p)(void*), void* arg_p){
 /* Destroy the threadpool */
 void thpool_destroy(thpool_t* tp_p){
 	int t;
-	
+
 	/* End each thread's infinite loop */
 	thpool_keepalive=0; 
 
-	/* Awake idle threads waiting at semaphore */
+	/* Awake idle threads waiting at semaphore and mutex*/
 	for (t=0; t<(tp_p->threadsN); t++){
-		if (sem_post(tp_p->jobqueue->queueSem)){
+		if (sem_post(tp_p->jobqueue[t]->queueSem)){
 			fprintf(stderr, "thpool_destroy(): Could not bypass sem_wait()\n");
+		}
+
+	/* Kill semaphore and mutex */
+	for (t = 0; t < tp_p->threadsN; t++){
+		if (sem_destroy(tp_p->jobqueue[t]->queueSem) != 0){
+		fprintf(stderr, "thpool_destroy(): Could not destroy semaphore\n");
+		}
+
+		if (pthread_mutex_destroy(&tp_p->jobqueue[t]->q_tail_lock) ||
+			pthread_mutex_destroy(&tp_p->jobqueue[t]->q_head_lock)){
+			fprintf(stderr, "thpool_destroy(): Could not destroy q_tail_lock or q_head_lock.\n");
 		}
 	}
 
-	/* Kill semaphore */
-	if (sem_destroy(tp_p->jobqueue->queueSem)!=0){
-		fprintf(stderr, "thpool_destroy(): Could not destroy semaphore\n");
-	}
-	
 	/* Wait for threads to finish */
 	for (t=0; t<(tp_p->threadsN); t++){
 		pthread_join(tp_p->threads[t], NULL);
 	}
-	
-	thpool_jobqueue_empty(tp_p);
-	
-	/* Dealloc */
-	free(tp_p->threads);                                                   /* DEALLOC threads             */
-	free(tp_p->jobqueue->queueSem);                                        /* DEALLOC job queue semaphore */
-	free(tp_p->jobqueue);                                                  /* DEALLOC job queue           */
-	free(tp_p);                                                            /* DEALLOC thread pool         */
-}
 
+	/* There are 2 reasons that we need to "reflush" job queue:
+	 * 1. Awaken threads may add work in job queue.
+	 * 2. Job queue won't be real empty, even thread think it's emplty. */
+	for (t = 0; t < tp_p->threadsN; t++){
+		thpool_jobqueue_empty(tp_p->jobqueue[t]);
+	}
+
+	/* Dealloc */
+	free(tp_p->threads);
+
+	for (t = 0; t < tp_p->threadsN; t++){
+		free(tp_p->jobqueue[t]);
+	}
+
+	free(tp_p);
+}
 
 
 /* =================== JOB QUEUE OPERATIONS ===================== */
 
-
-
 /* Initialise queue */
-int thpool_jobqueue_init(thpool_t* tp_p){
-	tp_p->jobqueue=(thpool_jobqueue*)malloc(sizeof(thpool_jobqueue));      /* MALLOC job queue */
-	if (tp_p->jobqueue==NULL) return -1;
-	tp_p->jobqueue->tail=NULL;
-	tp_p->jobqueue->head=NULL;
-	tp_p->jobqueue->jobsN=0;
+int thpool_jobqueue_init(thpool_jobqueue **jobqueue){
+	*jobqueue = malloc(sizeof(thpool_jobqueue));
+
+	if (jobqueue == NULL){
+		return -1;
+}
+
+	/* We need an empty node to avoid 2 tricky special situation:
+	 * 1. add first node to empty queue.
+	 * 2. del last node from queue. */
+	thpool_job_t *empty_job = malloc(sizeof(thpool_job_t));
+
+	if (empty_job == NULL){
+		free(*jobqueue);
+		return -1;
+	}
+
+	empty_job->next = NULL;
+
+	/* printf("empty_job's address is %p\n", empty_job); */
+	(*jobqueue)->tail = empty_job;
+	(*jobqueue)->head = empty_job;
+
+	(*jobqueue)->queueSem = malloc(sizeof(sem_t));
+
+	if((*jobqueue)->queueSem == NULL){
+		free(*jobqueue);
+		free(empty_job);
+		return -1;
+	}
+
+	if (sem_init((*jobqueue)->queueSem, 0, 0) == -1){ /* no shared, initial value */
+		perror("sem_init(): ");
+		goto JOBQUEUE_INIT_ERROR;
+	}
+
+	if (pthread_mutex_init(& (*jobqueue)->q_head_lock, NULL) == -1 ||
+		pthread_mutex_init(& (*jobqueue)->q_tail_lock, NULL) == -1){
+		perror("phtread_mutex_init(): ");
+		goto JOBQUEUE_INIT_ERROR;
+	}
+
 	return 0;
+
+JOBQUEUE_INIT_ERROR:
+	free(*jobqueue);
+	free(empty_job);
+	free((*jobqueue)->queueSem);
+	return -1;
 }
 
 
 /* Add job to queue */
-void thpool_jobqueue_add(thpool_t* tp_p, thpool_job_t* newjob_p){ /* remember that job prev and next point to NULL */
+void thpool_jobqueue_add(thpool_jobqueue *jobqueue, thpool_job_t *newjob_p){
+	newjob_p->next = NULL;
 
-	newjob_p->next=NULL;
-	newjob_p->prev=NULL;
-	
-	thpool_job_t *oldFirstJob;
-	oldFirstJob = tp_p->jobqueue->head;
-	
-	/* fix jobs' pointers */
-	switch(tp_p->jobqueue->jobsN){
-		
-		case 0:     /* if there are no jobs in queue */
-					tp_p->jobqueue->tail=newjob_p;
-					tp_p->jobqueue->head=newjob_p;
-					break;
-		
-		default: 	/* if there are already jobs in queue */
-					oldFirstJob->prev=newjob_p;
-					newjob_p->next=oldFirstJob;
-					tp_p->jobqueue->head=newjob_p;
+	pthread_mutex_lock(&jobqueue->q_tail_lock);
 
-	}
+	jobqueue->tail->next = newjob_p;
+	jobqueue->tail = newjob_p;
 
-	(tp_p->jobqueue->jobsN)++;     /* increment amount of jobs in queue */
-	sem_post(tp_p->jobqueue->queueSem);
-	
-	int sval;
-	sem_getvalue(tp_p->jobqueue->queueSem, &sval);
+	sem_post(jobqueue->queueSem);
+
+	pthread_mutex_unlock(&jobqueue->q_tail_lock);
 }
 
 
-/* Remove job from queue */
-int thpool_jobqueue_removelast(thpool_t* tp_p){
-	thpool_job_t *oldLastJob;
-	oldLastJob = tp_p->jobqueue->tail;
-	
-	/* fix jobs' pointers */
-	switch(tp_p->jobqueue->jobsN){
-		
-		case 0:     /* if there are no jobs in queue */
-					return -1;
-					break;
-		
-		case 1:     /* if there is only one job in queue */
-					tp_p->jobqueue->tail=NULL;
-					tp_p->jobqueue->head=NULL;
-					break;
-					
-		default: 	/* if there are more than one jobs in queue */
-					oldLastJob->prev->next=NULL;               /* the almost last item */
-					tp_p->jobqueue->tail=oldLastJob->prev;
-					
+/* Get value of the first job from queue and remove it. */
+int thpool_jobqueue_get(thpool_jobqueue *jobqueue, struct job_value *pvalue){
+	pthread_mutex_lock(&jobqueue->q_head_lock);
+
+	thpool_job_t *node = jobqueue->head;
+	thpool_job_t *new_head = node->next;
+
+	if (new_head == NULL){
+		pthread_mutex_unlock(&jobqueue->q_head_lock);
+		return -1;
 	}
-	
-	(tp_p->jobqueue->jobsN)--;
-	
-	int sval;
-	sem_getvalue(tp_p->jobqueue->queueSem, &sval);
+
+	/* We don't return value of real head, but value of head->next. */
+	*pvalue = new_head->value;
+	jobqueue->head = new_head;
+
+	pthread_mutex_unlock(&jobqueue->q_head_lock);
+	free(node);
+
 	return 0;
 }
 
 
-/* Get first element from queue */
-thpool_job_t* thpool_jobqueue_peek(thpool_t* tp_p){
-	return tp_p->jobqueue->tail;
+/* Peek out job queue to see whether there are jobs. */
+thpool_job_t *thpool_jobqueue_peek(thpool_jobqueue *jobqueue){
+	return jobqueue->head->next;
 }
 
+
 /* Remove and deallocate all jobs in queue */
-void thpool_jobqueue_empty(thpool_t* tp_p){
-	
+void thpool_jobqueue_empty(thpool_jobqueue *jobqueue){
 	thpool_job_t* curjob;
-	curjob=tp_p->jobqueue->tail;
-	
-	while(tp_p->jobqueue->jobsN){
-		tp_p->jobqueue->tail=curjob->prev;
+	curjob = jobqueue->head;
+
+	while (jobqueue->head){
+		jobqueue->head = curjob->next;
 		free(curjob);
-		curjob=tp_p->jobqueue->tail;
-		tp_p->jobqueue->jobsN--;
+		curjob = jobqueue->head;
 	}
-	
+
 	/* Fix head and tail */
-	tp_p->jobqueue->tail=NULL;
-	tp_p->jobqueue->head=NULL;
+	jobqueue->tail = NULL;
+	jobqueue->head = NULL;
 }
+

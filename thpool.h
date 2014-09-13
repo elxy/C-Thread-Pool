@@ -1,7 +1,9 @@
 /********************************** 
  * @author      Johan Hanssen Seferidis
  * @date        12/08/2011
- * Last update: 01/11/2011
+ * Last update: 09/13/2014
+ *              Transfer to multiple job queue structure.
+ *              by elxy
  * License:     LGPL
  * 
  **********************************/
@@ -24,33 +26,42 @@
  * thpool       = threadpool
  * thpool_t     = threadpool type
  * tp_p         = threadpool pointer
+ * tag          = job's tag
  * sem          = semaphore
+ * h_lock       = lock of job queue head
+ * t_lock       = lock of job queue tail
  * xN           = x can be any string. N stands for amount
  * 
  * */
                   
-/*              _______________________________________________________        
- *             /                                                       \
- *             |   JOB QUEUE        | job1 | job2 | job3 | job4 | ..   |
- *             |                                                       |
- *             |   threadpool      | thread1 | thread2 | ..           |
- *             \_______________________________________________________/
+/*              _____________________________________________________________        
+ *             /                                                             \
+ *             |   JOB QUEUEs      | queue 1 | job | job | job | job | ..    |
+ *             |                   | queue 2 | job | job | job | job | ..    |
+ *             |                   | queue 3 | job | job | job | job | ..    |
+ *             |                      ...                                    |
+ *             |                                                             |
+ *             |   threadpool      | thread1 | thread2 | thread3 | ..        |
+ *             \_____________________________________________________________/
  * 
- *    Description:       Jobs are added to the job queue. Once a thread in the pool
- *                       is idle, it is assigned with the first job from the queue(and
- *                       erased from the queue). It's each thread's job to read from 
- *                       the queue serially(using lock) and executing each job
- *                       until the queue is empty.
+ *    Description:       Jobs are added to the job queues. Which queue it wiil be added
+ *                       to depends on tag (or use hash func). Once a thread in the pool
+ *                       is idle, it is assigned with the first job from its queue (and
+ *                       erased from the queue). It's each thread's job to read from the
+ *                       queue and executing each job until the queue is empty. All
+ *                       threads could add jobs to job queues. We use lock to guarantee
+ *                       adding serial.
  * 
  * 
  *    Scheme:
  * 
- *    thpool______                jobqueue____                      ______ 
- *    |           |               |           |       .----------->|_job0_| Newly added job
- *    |           |               |  head------------'             |_job1_|
- *    | jobqueue----------------->|           |                    |_job2_|
- *    |           |               |  tail------------.             |__..__| 
- *    |___________|               |___________|       '----------->|_jobn_| Job for thread to take
+ *    thpool______                jobqueue1___                      ______ 
+ *    |           |               |           |       .----------->|_job0_| Job for thread to take
+ *    | jobqueue1---------------->|  head------------'             |_job1_|
+ *    |           |               |           |                    |_job2_|
+ *    | jobqueue2 |               |  tail------------.             |__..__| 
+ *    |    ...    |               |___________|       '----------->|_jobn_| Newly added job
+ *    |___________|
  * 
  * 
  *    job0________ 
@@ -77,19 +88,24 @@
 
 /* Individual job */
 typedef struct thpool_job_t{
+	struct job_value {
 	void*  (*function)(void* arg);                     /**< function pointer         */
 	void*                     arg;                     /**< function's argument      */
+	}                       value;
 	struct thpool_job_t*     next;                     /**< pointer to next job      */
-	struct thpool_job_t*     prev;                     /**< pointer to previous job  */
 }thpool_job_t;
 
 
 /* Job queue as doubly linked list */
+/* We use the Two-Lock Concurrent Queue Algorithm to maintain job queue.
+ * Ref: http://www.cs.rochester.edu/research/synchronization/pseudocode/queues.html
+ */
 typedef struct thpool_jobqueue{
 	thpool_job_t *head;                                /**< pointer to head of queue */
 	thpool_job_t *tail;                                /**< pointer to tail of queue */
-	int           jobsN;                               /**< amount of jobs in queue  */
-	sem_t        *queueSem;                            /**< semaphore(this is probably just holding the same as jobsN) */
+	sem_t          *queueSem;                          /**< semaphore(this is probably just holding the same as jobsN) */
+	pthread_mutex_t q_head_lock;                       /**< lock of head */
+	pthread_mutex_t q_tail_lock;                       /**< lock of tail */
 }thpool_jobqueue;
 
 
@@ -97,15 +113,12 @@ typedef struct thpool_jobqueue{
 typedef struct thpool_t{
 	pthread_t*       threads;                          /**< pointer to threads' ID   */
 	int              threadsN;                         /**< amount of threads        */
-	thpool_jobqueue* jobqueue;                         /**< pointer to the job queue */
+	/* Multiple job queues have following benefits:
+	 * 1. avoid performance loss when many threads race for one lock.
+	 * 2. enable complex job scheduling, making it possible that specific
+	 *    thread handle specific job. */
+	thpool_jobqueue   **jobqueue;                      /**< pointer to the job queues */
 }thpool_t;
-
-
-/* Container for all things that each thread is going to need */
-typedef struct thread_data{                            
-	pthread_mutex_t *mutex_p;
-	thpool_t        *tp_p;
-}thread_data;
 
 
 
@@ -133,10 +146,10 @@ thpool_t* thpool_init(int threadsN);
  * In principle this is an endless loop. The only time this loop gets interuppted is once
  * thpool_destroy() is invoked.
  * 
- * @param threadpool to use
+ * @param  job queue to use
  * @return nothing
  */
-void thpool_thread_do(thpool_t* tp_p);
+void thpool_thread_do(thpool_jobqueue *jobqueue);
 
 
 /**
@@ -149,11 +162,12 @@ void thpool_thread_do(thpool_t* tp_p);
  * ATTENTION: You have to cast both the function and argument to not get warnings.
  * 
  * @param  threadpool to where the work will be added to
+ * @param  tag to determine which job queue this work should be added
  * @param  function to add as work
  * @param  argument to the above function
  * @return int
  */
-int thpool_add_work(thpool_t* tp_p, void *(*function_p)(void*), void* arg_p);
+int thpool_add_work(thpool_t *tp_p, int tag, void * (*function_p)(void *), void *arg_p);
 
 
 /**
@@ -173,11 +187,11 @@ void thpool_destroy(thpool_t* tp_p);
 
 /**
  * @brief Initialize queue
- * @param  pointer to threadpool
+ * @param  pointer to job queue's pointer
  * @return 0 on success,
  *        -1 on memory allocation error
  */
-int thpool_jobqueue_init(thpool_t* tp_p);
+int thpool_jobqueue_init(thpool_jobqueue **jobqueue);
 
 
 /**
@@ -187,24 +201,24 @@ int thpool_jobqueue_init(thpool_t* tp_p);
  * before passed to this function or else other functions like thpool_jobqueue_empty()
  * will be broken.
  * 
- * @param pointer to threadpool
+ * @param pointer to job queue
  * @param pointer to the new job(MUST BE ALLOCATED)
  * @return nothing 
  */
-void thpool_jobqueue_add(thpool_t* tp_p, thpool_job_t* newjob_p);
+void thpool_jobqueue_add(thpool_jobqueue *jobqueue, thpool_job_t *newjob_p);
 
 
 /**
- * @brief Remove last job from queue. 
+ * @brief Get value of the first job from queue and remove it.
  * 
  * This does not free allocated memory so be sure to have peeked() \n
  * before invoking this as else there will result lost memory pointers.
  * 
- * @param  pointer to threadpool
+ * @param pointer to job queue
  * @return 0 on success,
  *         -1 if queue is empty
  */
-int thpool_jobqueue_removelast(thpool_t* tp_p);
+int thpool_jobqueue_get(thpool_jobqueue *jobqueue, struct job_value *pvalue);
 
 
 /** 
@@ -213,11 +227,11 @@ int thpool_jobqueue_removelast(thpool_t* tp_p);
  * Gets the last job that is inside the queue. This will work even if the queue
  * is empty.
  * 
- * @param  pointer to threadpool structure
+ * @param pointer to job queue
  * @return job a pointer to the last job in queue,
  *         a pointer to NULL if the queue is empty
  */
-thpool_job_t* thpool_jobqueue_peek(thpool_t* tp_p);
+thpool_job_t *thpool_jobqueue_peek(thpool_jobqueue *jobqueue);
 
 
 /**
@@ -227,9 +241,10 @@ thpool_job_t* thpool_jobqueue_peek(thpool_t* tp_p);
  * jobqueue to its initialization values, thus tail and head pointing
  * to NULL and amount of jobs equal to 0.
  * 
- * @param pointer to threadpool structure
+ * @param pointer to job queue
  * */
-void thpool_jobqueue_empty(thpool_t* tp_p);
+void thpool_jobqueue_empty(thpool_jobqueue *jobqueue);
+
 
 
 #endif

@@ -18,6 +18,7 @@
  * */
 
 #include <stdio.h>
+#include <inttypes.h>
 
 #include "thpool.h"
 
@@ -39,7 +40,7 @@ void task2(int a){
 
 
 int main(){
-	int i;
+	intptr_t i;
 
 	thpool_t* threadpool;             /* make a new thread pool structure     */
 	threadpool=thpool_init(4);        /* initialise it to 4 number of threads */

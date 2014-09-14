@@ -154,6 +154,7 @@ void thpool_destroy(thpool_t* tp_p){
 		if (sem_post(tp_p->jobqueue[t]->queueSem)){
 			fprintf(stderr, "thpool_destroy(): Could not bypass sem_wait()\n");
 		}
+	}
 
 	/* Kill semaphore and mutex */
 	for (t = 0; t < tp_p->threadsN; t++){
@@ -198,7 +199,7 @@ int thpool_jobqueue_init(thpool_jobqueue **jobqueue){
 
 	if (jobqueue == NULL){
 		return -1;
-}
+	}
 
 	/* We need an empty node to avoid 2 tricky special situation:
 	 * 1. add first node to empty queue.

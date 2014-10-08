@@ -94,9 +94,13 @@ void thpool_thread_do(thpool_jobqueue *jobqueue){
 
 	while(thpool_keepalive){
 
-		if (sem_wait(jobqueue->queueSem)){/* WAITING until there is work in the queue */
-			perror("thpool_thread_do(): Waiting for semaphore");
-			exit(1);
+		while(sem_wait(jobqueue->queueSem)){/* WAITING until there is work in the queue */
+			if (errno == EINTR) /* Ignore system signal. */
+				errno = 0;
+			else {
+				perror("thpool_thread_do(): Waiting for semaphore");
+				exit(1);
+			}
 		}
 
 		if (thpool_keepalive){
